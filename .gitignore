@@ -8,11 +8,14 @@ venv/
 .venv/
 env/
 ENV/
-causal-ttt/venv/
 
 # Other project folders
 papers/
 TE-CDE-main/
+
+# Model checkpoints and generated results
+checkpoints/
+results/
 
 # IDE & OS specific
 .vscode/
