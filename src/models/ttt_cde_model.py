@@ -154,11 +154,8 @@ Key features:
         # 1. Reconstruction of current observation
         # 2. Multi-step forecasting (forecast_horizon steps)
         # 3. Feature disentanglement (predictable vs unpredictable components)
-        # Calculate output size based on whether we include treatment in auxiliary task
-        if self.include_treatment_in_aux:
-            output_size = input_channels_x * (1 + forecast_horizon + 1) + num_treatments  # Current + forecast steps + disentanglement + treatment
-        else:
-            output_size = input_channels_x * (1 + forecast_horizon + 1)  # Current + forecast steps + disentanglement
+        # Calculate output size for auxiliary network: reconstructs current features
+        output_size = self.input_channels_x
         
         self.auxiliary_network = nn.Sequential(
             nn.Linear(hidden_channels, 3 * hidden_channels),
@@ -197,15 +194,6 @@ Key features:
         
         # Dropout for regularization
         self.dropout_layer = torch.nn.Dropout(p=dropout_rate)
-        
-        # Enhanced auxiliary network for test-time training
-        # Now predicts both next value and reconstruction of current value
-        self.auxiliary_network = torch.nn.Sequential(
-            torch.nn.Linear(hidden_channels, hidden_channels // 2),
-            torch.nn.LayerNorm(self.hidden_channels // 2),  # Layer normalization for more stable training
-            torch.nn.ReLU(),
-            torch.nn.Linear(self.hidden_channels // 2, 2 * input_channels_x)  # Double size output for dual task
-        )
         
         # For counterfactual prediction: treatment embedding with normalization
         self.treatment_embedding = torch.nn.Parameter(
@@ -298,168 +286,46 @@ Key features:
 
     def auxiliary_task(self, z_hat, coeffs_x):
         """
-        Enhanced self-supervised auxiliary task for test-time training.
-        
-        This method performs multiple self-supervised tasks:
-        1. Reconstruction: Predicts the current observation from the hidden state
-        2. Multi-step Forecasting: Predicts multiple future observations
-        3. Feature Disentanglement: Separates predictable from stochastic components
-        4. Temporal Consistency: Ensures predictions are temporally coherent
+        Simplified self-supervised auxiliary task for test-time training.
+        This task aims to reconstruct the features of the final observed time point.
         
         Args:
-            z_hat: Hidden state at the final timestep
-            coeffs_x: Tensor containing coefficients for interpolation
+            z_hat: Hidden state at the final timestep from the CDE.
+            coeffs_x: Tensor containing coefficients for interpolation of the input path X.
             
         Returns:
-            loss: Combined auxiliary loss value for test-time training
+            loss: Reconstruction loss for the final observed features.
         """
-        # Get the interpolation
-        x = self.get_interpolation(coeffs_x)
-        grid_points = x.grid_points
+        # Get the interpolation of the input path X
+        x_path = self.get_interpolation(coeffs_x)
+        grid_points = x_path.grid_points
         
-        # Make sure we have at least one point
-        if len(grid_points) <= 0:
-            # If no points, return zero loss
+        # Ensure there's at least one point in the path
+        if len(grid_points) == 0:
             return torch.tensor(0.0, device=z_hat.device)
         
-        # For multi-step forecasting, we need to have at least forecast_horizon + 1 points
-        # Get the last few observations
-        observations = []
-        for i in range(min(len(grid_points), self.forecast_horizon + 1)):
-            if i < len(grid_points):
-                # Evaluate at last few timesteps (starting from the most recent)
-                t = grid_points[-(i+1)]
-                obs = x.evaluate(t)
-                # Remove time dimension if it exists
-                if obs.shape[-1] > self.input_channels_x:
-                    obs = obs[..., 1:]
-                observations.append(obs)
+        # Get the features of the last observed point in the time series
+        # grid_points are sorted, so grid_points[-1] is the last time t_m
+        last_observed_t = grid_points[-1]
+        last_observed_features = x_path.evaluate(last_observed_t)
         
-        # If we don't have enough observations, pad with duplicates of the last one
-        while len(observations) < self.forecast_horizon + 1:
-            if len(observations) > 0:
-                observations.append(observations[-1].clone())
-            else:
-                # This should not happen normally, but just in case
-                dummy_obs = torch.zeros(z_hat.size(0), self.input_channels_x, device=z_hat.device)
-                observations.append(dummy_obs)
-        
-        # Current observation is the first one in our list (most recent)
-        current_obs = observations[0]
-        
-        # Generate predictions from the auxiliary network
-        pred = self.auxiliary_network(z_hat)
-        
-        # Split the predictions based on tasks
-        chunk_size = self.input_channels_x
-        pred_current = pred[:, :chunk_size]  # Reconstruction of current observation
-        
-        # Multi-step forecasting predictions
-        forecasting_preds = []
-        for i in range(self.forecast_horizon):
-            start_idx = chunk_size * (i + 1)
-            end_idx = start_idx + chunk_size
-            forecasting_preds.append(pred[:, start_idx:end_idx])
-        
-        # Feature disentanglement - predict decomposition of features
-        # Make sure we don't exceed the available dimensions
-        disentanglement_idx = chunk_size * (self.forecast_horizon + 1)
-        if disentanglement_idx + chunk_size <= pred.shape[1]:
-            pred_disentangled = pred[:, disentanglement_idx:disentanglement_idx + chunk_size]
-        else:
-            # If we don't have enough dimensions, create zeros with the right shape
-            pred_disentangled = torch.zeros_like(current_obs)
-        
-        # Calculate losses
-        # 1. Reconstruction loss for current observation
-        reconstruction_loss = F.mse_loss(pred_current, current_obs)
-        
-        # 2. Multi-step forecasting loss with distance weighting
-        forecasting_loss = 0.0
-        forecast_weights_sum = 0.0
-        
-        # We need at least 2 observations to do forecasting (current + next)
-        if len(observations) >= 2:
-            for i in range(min(len(observations)-1, self.forecast_horizon)):
-                # Earlier predictions have higher weights
-                weight = 1.0 / (i + 1)
-                # Skip if dimensions don't match
-                if forecasting_preds[i].shape == observations[i+1].shape and observations[i+1].numel() > 0:
-                    step_loss = F.mse_loss(forecasting_preds[i], observations[i+1])
-                    forecasting_loss += weight * step_loss
-                    forecast_weights_sum += weight
+        # Remove time dimension if it was part of the input features to CDE
+        if self.input_has_time and last_observed_features.shape[-1] > self.input_channels_x:
+            last_observed_features = last_observed_features[..., 1:] # Assuming time is the first channel
             
-            # Normalize by weights if we have any forecasting loss
-            if forecast_weights_sum > 0:
-                forecasting_loss /= forecast_weights_sum
+        # The auxiliary network predicts the features of the last observed point
+        predicted_features = self.auxiliary_network(z_hat)
         
-        # 3. Feature disentanglement loss - orthogonality constraint
-        # Make sure both tensors have the same shape
-        if current_obs.shape == pred_disentangled.shape and current_obs.numel() > 0:
-            disentanglement_loss = torch.mean(torch.abs(torch.sum(current_obs * pred_disentangled, dim=1)))
-        else:
-            # If shapes don't match, use a zero loss
-            disentanglement_loss = torch.tensor(0.0, device=z_hat.device)
+        # Ensure shapes match for loss calculation
+        if predicted_features.shape != last_observed_features.shape:
+            # This might happen if batch sizes differ or there's a configuration mismatch.
+            # Log an error or warning, and return a zero loss to avoid crashing.
+            # For a robust implementation, consider how to handle or prevent this.
+            # logging.warning(f"Shape mismatch in auxiliary task: pred {predicted_features.shape}, actual {last_observed_features.shape}")
+            return torch.tensor(0.0, device=z_hat.device)
         
-        # 4. Temporal consistency loss
-        temporal_loss = 0.0
-        temporal_count = 0
-        
-        if self.forecast_horizon > 1:
-            for i in range(self.forecast_horizon - 1):
-                # Make sure we have valid tensors and matching shapes
-                if (i+1 < len(forecasting_preds) and 
-                    forecasting_preds[i].numel() > 0 and 
-                    forecasting_preds[i+1].numel() > 0 and
-                    forecasting_preds[i].shape == forecasting_preds[i+1].shape):
-                    
-                    # Calculate difference between consecutive predicted timesteps
-                    pred_diff = forecasting_preds[i+1] - forecasting_preds[i]
-                    
-                    # If we have enough observations, compare with actual differences
-                    if (i + 2 < len(observations) and 
-                        observations[i+1].numel() > 0 and 
-                        observations[i+2].numel() > 0 and
-                        observations[i+1].shape == observations[i+2].shape and
-                        pred_diff.shape == observations[i+2].shape):
-                        
-                        actual_diff = observations[i+2] - observations[i+1]
-                        temporal_loss += F.mse_loss(pred_diff, actual_diff)
-                        temporal_count += 1
-                    else:
-                        # Encourage smoothness if no ground truth is available or shapes don't match
-                        temporal_loss += torch.mean(torch.square(pred_diff))
-                        temporal_count += 1
-            
-            if temporal_count > 0:
-                temporal_loss /= temporal_count
-            else:
-                # If we couldn't calculate any temporal loss, use zero
-                temporal_loss = torch.tensor(0.0, device=z_hat.device)
-        
-        # Get treatment prediction if included in auxiliary task
-        treatment_loss = 0.0
-        if self.include_treatment_in_aux:
-            # Extract treatment prediction from the auxiliary network output
-            treatment_pred_idx = chunk_size * (self.forecast_horizon + 1) + chunk_size
-            treatment_pred = pred[:, treatment_pred_idx:treatment_pred_idx + self.num_treatments]
-            
-            # If we have the ground truth treatment, calculate loss
-            # This requires the treatment to be encoded in the coefficients
-            # For demonstration, we'll just use a dummy loss if we can't extract actual treatments
-            treatment_loss = torch.tensor(0.0, device=z_hat.device)
-        
-        # Combine all losses with task weights from config
-        loss = (
-            self.aux_task_weights['reconstruction'] * reconstruction_loss + 
-            self.aux_task_weights['forecasting'] * forecasting_loss + 
-            self.aux_task_weights['temporal'] * temporal_loss + 
-            self.aux_task_weights['disentanglement'] * disentanglement_loss
-        )
-        
-        # Add treatment loss if included
-        if self.include_treatment_in_aux and treatment_loss > 0:
-            loss = loss + 0.2 * treatment_loss  # Add treatment prediction loss with weight
+        # Calculate reconstruction loss (Mean Squared Error)
+        loss = F.mse_loss(predicted_features, last_observed_features)
         
         return loss
         

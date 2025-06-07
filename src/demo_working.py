@@ -73,6 +73,8 @@ def generate_synthetic_data(num_samples=100, seq_len=10, num_features=5,
 
 def run_demo():
     """Run a demo of the TTT-Neural CDE model on synthetic data."""
+    print("--- SCRIPT START ---")
+    print(f"Logger level: {logger.level}, Root logger level: {root_logger.level}, Effective logger level: {logger.getEffectiveLevel()}")
     # Check for MPS (Apple Silicon) availability first, then CUDA, otherwise fall back to CPU
     if torch.backends.mps.is_available() and torch.backends.mps.is_built():
         device = torch.device('mps')
@@ -144,16 +146,8 @@ def run_demo():
         ttt_steps=20,                  # More steps for test-time training
         ttt_lr=0.01,                   # Higher learning rate for adaptation
         ttt_loss_weight=0.2,           # Increased weight for auxiliary task
-        # Custom weights for auxiliary task components
-        aux_task_weights={
-            'reconstruction': 0.3,
-            'forecasting': 0.4,        # Prioritize forecasting more
-            'temporal': 0.2,
-            'disentanglement': 0.1
-        },
+        include_treatment_in_aux=False,  # Simplified aux task does not include treatment
         use_attention=True,            # Use attention mechanism
-        forecast_horizon=3,            # Multi-step forecasting in auxiliary task
-        include_treatment_in_aux=True, # Include treatment in auxiliary task
         ttt_early_stopping_patience=5, # Early stopping for TTT
         ttt_lr_decay=0.9              # Learning rate decay for TTT
     ).to(device)
@@ -379,6 +373,7 @@ def run_demo():
     plt.savefig(os.path.join(output_dir, 'counterfactuals.png'))
     
     logger.info(f"Demo completed! Results saved to {output_dir}")
+    print("--- SCRIPT END ---")
     
 
 if __name__ == "__main__":
