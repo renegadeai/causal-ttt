@@ -317,28 +317,40 @@ def run_demo():
     np.save(os.path.join(output_dir, 'prediction_results.npy'), results)
     
     # Plot comparison
-    plt.figure(figsize=(12, 5))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5)) # Get Axes objects
     
     # Show only first 20 samples for clarity
     plot_size = min(20, len(y_test))
     
-    plt.subplot(1, 2, 1)
-    plt.scatter(y_test[:plot_size].cpu().numpy(), 
+    # Standard Prediction Plot
+    ax1.scatter(y_test[:plot_size].cpu().numpy(), 
                 std_pred[:plot_size].detach().cpu().numpy(), alpha=0.7)
-    plt.plot([y_test.min().item(), y_test.max().item()], 
+    ax1.plot([y_test.min().item(), y_test.max().item()], 
              [y_test.min().item(), y_test.max().item()], 'r--')
-    plt.title('Standard Prediction')
-    plt.xlabel('True Values')
-    plt.ylabel('Predicted Values')
+    ax1.set_title('Standard Prediction')
+    ax1.set_xlabel('True Values')
+    ax1.set_ylabel('Predicted Values')
+    # Add metrics text for standard prediction
+    std_metrics_text = (f"R²: {std_metrics['r2']:.2f}\n"
+                        f"MAE: {std_metrics['mae']:.2f}\n"
+                        f"MSE: {std_metrics['mse']:.2f}")
+    ax1.text(0.05, 0.95, std_metrics_text, transform=ax1.transAxes, fontsize=9,
+             verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', fc='wheat', alpha=0.5))
     
-    plt.subplot(1, 2, 2)
-    plt.scatter(y_test[:plot_size].cpu().numpy(), 
+    # TTT Prediction Plot
+    ax2.scatter(y_test[:plot_size].cpu().numpy(), 
                 ttt_pred[:plot_size].detach().cpu().numpy(), alpha=0.7)
-    plt.plot([y_test.min().item(), y_test.max().item()], 
+    ax2.plot([y_test.min().item(), y_test.max().item()], 
              [y_test.min().item(), y_test.max().item()], 'r--')
-    plt.title('TTT Prediction')
-    plt.xlabel('True Values')
-    plt.ylabel('Predicted Values')
+    ax2.set_title('TTT Prediction')
+    ax2.set_xlabel('True Values')
+    ax2.set_ylabel('Predicted Values')
+    # Add metrics text for TTT prediction
+    ttt_metrics_text = (f"R²: {ttt_metrics['r2']:.2f}\n"
+                        f"MAE: {ttt_metrics['mae']:.2f}\n"
+                        f"MSE: {ttt_metrics['mse']:.2f}")
+    ax2.text(0.05, 0.95, ttt_metrics_text, transform=ax2.transAxes, fontsize=9,
+             verticalalignment='top', bbox=dict(boxstyle='round,pad=0.3', fc='wheat', alpha=0.5))
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'prediction_comparison.png'))
