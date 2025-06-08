@@ -8,6 +8,7 @@ import torch.nn as nn
 import torchcde
 from torch.nn import functional as F
 
+logger = logging.getLogger(__name__)
 
 class CDEFunc(torch.nn.Module):
     """
@@ -77,7 +78,10 @@ Key features:
         include_treatment_in_aux=True,
         ttt_early_stopping_patience=5,
         ttt_lr_decay=0.9,
-        cf_strength=1.0  # New parameter for counterfactual strength
+        cf_strength=1.0,  # New parameter for counterfactual strength
+        cde_rtol=1e-5,
+        cde_atol=1e-5,
+        cde_method='rk4'
     ):
         """
         Args:
@@ -128,6 +132,11 @@ Key features:
         
         # Store cf_strength
         self.cf_strength = cf_strength
+
+        # CDE solver parameters
+        self.cde_rtol = cde_rtol
+        self.cde_atol = cde_atol
+        self.cde_method = cde_method
         
         # Input embedding with batch normalization for stable training
         self.embed_x = torch.nn.Sequential(
@@ -329,197 +338,356 @@ Key features:
         
         return loss
         
-    def ttt_forward(self, coeffs_x, device, adapt=True):
+    def auxiliary_task(self, z_hat, coeffs_x):
         """
-        Enhanced forward pass with test-time training.
-        
-        This enhanced version includes:
-        1. Learning rate scheduling with exponential decay
-        2. Early stopping with configurable patience
-        3. Gradient norm clipping for stability
-        4. State dict saving for best model during adaptation
-        
+        Self-supervised auxiliary task for TTT. Reconstructs final observed features.
         Args:
-            coeffs_x: Tensor containing coefficients for interpolation
-            device: Device to run the model on
-            adapt: Whether to perform test-time adaptation
-            
+            z_hat: Hidden state from CDE.
+            coeffs_x: Path object or Tensor for input path X.
         Returns:
-            pred_y: Predicted outcome
-            pred_a_softmax: Predicted treatment probabilities
-            pred_a: Predicted treatment logits
-            z_hat: Final hidden state after adaptation
+            loss: Reconstruction loss.
         """
-        # If no adaptation requested, just use the normal forward pass
+        aux_net_device = next(self.auxiliary_network.parameters()).device
+        z_hat = z_hat.to(aux_net_device)
+
+        if isinstance(coeffs_x, torch.Tensor):
+            coeffs_x_on_device = coeffs_x.to(aux_net_device)
+            x_path = self.get_interpolation(coeffs_x_on_device)
+        else: 
+            x_path = self.get_interpolation(coeffs_x)
+
+        grid_points = x_path.grid_points
+        if len(grid_points) == 0:
+            logger.warning("TTT: Auxiliary task received path with no grid points. Returning zero loss.")
+            return torch.tensor(0.0, device=aux_net_device, requires_grad=True)
+        
+        last_observed_t = grid_points[-1]
+        last_observed_features = x_path.evaluate(last_observed_t).to(aux_net_device)
+        
+        if self.input_has_time and last_observed_features.shape[-1] > self.input_channels_x:
+            last_observed_features = last_observed_features[..., 1:]
+            
+        predicted_features = self.auxiliary_network(z_hat)
+        
+        if predicted_features.shape != last_observed_features.shape:
+            logger.warning(f"TTT: Shape mismatch in auxiliary task. Pred: {predicted_features.shape}, Actual: {last_observed_features.shape}. Returning zero loss.")
+            return torch.tensor(0.0, device=aux_net_device, requires_grad=True)
+        
+        loss = F.mse_loss(predicted_features, last_observed_features)
+        logger.debug(f"TTT: Aux loss: {loss.item():.4f}, grad: {loss.requires_grad}, grad_fn: {loss.grad_fn is not None}")
+        return loss
+
+    def ttt_forward(self, coeffs_x, device, adapt=True, force_bn_eval_if_bs_is_one=False):
+        """
+        Forward pass with Test-Time Training (TTT).
+        Adapts model parameters to minimize a self-supervised auxiliary loss.
+        Args:
+            coeffs_x: Path object or Tensor for input path X.
+            device: PyTorch device for computation.
+            adapt (bool): If True, performs TTT.
+            force_bn_eval_if_bs_is_one (bool): If True and batch size is 1, forces BatchNorm layers in adapted modules to eval mode.
+        Returns:
+            Tuple (pred_y, pred_a_softmax, pred_a, z_hat_final): Predictions and final hidden state.
+        """
+
+        # Perform an initial forward pass.
+        # coeffs_x is assumed to be on the correct device or a path object.
+        # self.forward's mcd parameter defaults to True, which is consistent with
+        # how it would have been called if adapt=False previously (implicitly).
+        
+        # Check for batch size 1 to handle BatchNorm layers
+        initial_bn_states = {}
+        if force_bn_eval_if_bs_is_one:
+            if isinstance(coeffs_x, torch.Tensor):
+                batch_size = coeffs_x.shape[0]
+            else:
+                # For path object
+                batch_size = coeffs_x[0].shape[0] if len(coeffs_x) > 0 else 0
+            
+            # If batch size is 1, force BatchNorm layers to eval mode
+            if batch_size == 1:
+                # Find all BatchNorm layers and store their current training states
+                for name, module in self.named_modules():
+                    if isinstance(module, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d)):
+                        initial_bn_states[name] = module.training
+                        module.eval()
+                logger.info("Initial forward pass with batch size 1: Setting BatchNorm layers to eval mode")
+        
+        # Perform initial forward pass
+        try:
+            pred_y_initial, pred_a_softmax_initial, pred_a_initial, z_hat_initial = self.forward(coeffs_x, device=device)
+        finally:
+            # Restore original BatchNorm states if changed
+            if initial_bn_states:
+                for name, training in initial_bn_states.items():
+                    if name in dict(self.named_modules()):
+                        dict(self.named_modules())[name].train(training)
+
         if not adapt:
-            return self.forward(coeffs_x, device)
+            return pred_y_initial, pred_a_softmax_initial, pred_a_initial, z_hat_initial
+
+        # Forcefully enable gradients for the TTT scope
+        original_grad_enabled_state = torch.is_grad_enabled()
+        torch.set_grad_enabled(True)
+        try:
+            # Configure parameters for TTT adaptation
+            modules_to_adapt_config = [
+                (self.auxiliary_network, self.ttt_lr, "auxiliary_network"),
+                (self.cde_func, self.ttt_lr, "cde_func"),
+                (self.embed_x, self.ttt_lr, "embed_x")
+            ]
+            if self.use_attention and self.attention is not None:
+                modules_to_adapt_config.append((self.attention, self.ttt_lr, "attention"))
+
+            params_to_adapt_list = []
+            param_groups_for_optimizer = []
+
+            for module, lr, name in modules_to_adapt_config:
+                if module is not None:
+                    module_params = list(module.parameters())
+                    if not module_params:
+                        logger.warning(f"TTT: Module {name} has no parameters to adapt.")
+                        continue
+                    # Ensure parameters require gradients
+                    for p in module_params: 
+                        p.requires_grad_(True)
+                    params_to_adapt_list.extend(module_params)
+                    param_groups_for_optimizer.append({'params': module_params, 'lr': lr})
+                else:
+                    logger.warning(f"TTT: Module {name} is None and cannot be adapted.")
+
+            if not params_to_adapt_list:
+                logger.warning("TTT: No parameters to adapt. Skipping TTT optimization.")
+                # TTT skipped as no parameters to adapt, return initial predictions.
+                torch.set_grad_enabled(original_grad_enabled_state) # Restore grad state before early return
+                return pred_y_initial, pred_a_softmax_initial, pred_a_initial, z_hat_initial
             
-        # Store original parameters to restore later
-        original_params = {name: param.clone() for name, param in self.named_parameters()}
-        
-        # Create parameter groups for optimization during TTT
-        # We're focusing adaptation on representation learning components
-        param_groups = [
-            {'params': self.auxiliary_network.parameters(), 'lr': self.ttt_lr},
-            {'params': self.cde_func.parameters(), 'lr': self.ttt_lr * 0.1},
-            {'params': self.embed_x.parameters(), 'lr': self.ttt_lr * 0.1},
-        ]
-        
-        # If using attention, include those parameters
-        if self.use_attention:
-            param_groups.append({'params': self.attention.parameters(), 'lr': self.ttt_lr * 0.1})
-        
-        # Create optimizer for TTT
-        optimizer = torch.optim.Adam(param_groups)
-        
-        # Add learning rate scheduler
-        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=self.ttt_lr_decay)
-        
-        # Variables for early stopping
-        best_loss = float('inf')
-        patience = self.ttt_early_stopping_patience
-        counter = 0
-        best_state_dict = None
-        
-        # Store performance metrics
-        ttt_losses = []
-        
-        # Perform test-time training steps
-        for step in range(self.ttt_steps):
-            # Get the interpolation
-            x = self.get_interpolation(coeffs_x)
+            optimizer = torch.optim.Adam(param_groups_for_optimizer)
+            scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=self.ttt_lr_decay)
+
+            best_loss = float('inf')
+            patience_counter = 0
+            initial_adapted_params_state = {name: p.clone().detach() for name, p in self.named_parameters() if any(p is p_adapted for p_adapted in params_to_adapt_list)}
+            best_adapted_state_dict = {k: v.clone() for k, v in initial_adapted_params_state.items()}
+
+            # Store original training modes and set to train() for TTT
+            adapted_modules_for_mode_change = [m_config[0] for m_config in modules_to_adapt_config]
+            original_modes = {}
             
-            # Get initial hidden state
-            initial_x = x.evaluate(x.interval[0])
-            if initial_x.shape[-1] > self.input_channels_x:
-                initial_x = initial_x[..., 1:]
-            
-            # Compute the embedding and CDE
-            z_x = self.embed_x(initial_x).to(device)
-            
-            # Solve the CDE
-            z_hat = torchcde.cdeint(
-                X=x, 
-                z0=z_x, 
-                func=self.cde_func, 
-                t=x.grid_points,
-                rtol=torch.tensor(1e-3, dtype=torch.float32), 
-                atol=torch.tensor(1e-5, dtype=torch.float32),
-                method='rk4'
-            )
-            
-            # Apply attention if used
-            if self.use_attention:
-                # Compute attention weights
-                batch_size, seq_len, hidden_dim = z_hat.shape
-                z_flat = z_hat.reshape(-1, hidden_dim)
-                attn_weights = self.attention(z_flat).reshape(batch_size, seq_len, 1)
-                attn_weights = F.softmax(attn_weights, dim=1)
-                
-                # Apply attention weights
-                z_hat = torch.sum(z_hat * attn_weights, dim=1)
+            # This inner try/finally handles module mode restoration
+            try: 
+                for module_to_set_mode in adapted_modules_for_mode_change:
+                    if isinstance(module_to_set_mode, torch.nn.Module):
+                        original_modes[module_to_set_mode] = module_to_set_mode.training
+                        module_to_set_mode.train()
+
+                if isinstance(coeffs_x, tuple):
+                    batch_size = coeffs_x[0].shape[0]
+                elif isinstance(coeffs_x, torch.Tensor):
+                    batch_size = coeffs_x.shape[0]
+                else:
+                    logger.warning("TTT: Could not determine batch size from coeffs_x type.")
+                    batch_size = -1 
+
+                if force_bn_eval_if_bs_is_one and batch_size == 1:
+                    logger.debug("TTT: Batch size is 1 and force_bn_eval_if_bs_is_one is True. Setting BatchNorm layers to eval mode.")
+                    for main_module in adapted_modules_for_mode_change:
+                        if isinstance(main_module, torch.nn.Module):
+                            for sub_m in main_module.modules():
+                                if isinstance(sub_m, torch.nn.modules.batchnorm._BatchNorm):
+                                    if sub_m not in original_modes: 
+                                        original_modes[sub_m] = sub_m.training
+                                    sub_m.eval() 
+
+                # TTT optimization loop
+                for step in range(self.ttt_steps):
+                    optimizer.zero_grad()
+                    
+                    current_coeffs_x_for_cde = coeffs_x.to(device) if isinstance(coeffs_x, torch.Tensor) else coeffs_x
+                    x_cde_path = self.get_interpolation(current_coeffs_x_for_cde)
+                    
+                    initial_x_for_embed = x_cde_path.evaluate(x_cde_path.interval[0]).to(device)
+                    if self.input_has_time and initial_x_for_embed.shape[-1] > self.input_channels_x:
+                        initial_x_for_embed = initial_x_for_embed[..., 1:]
+                    
+                    z0_cde = self.embed_x(initial_x_for_embed)
+                    
+                    z_hat_sequence = torchcde.cdeint(
+                        X=x_cde_path, z0=z0_cde, func=self.cde_func, 
+                        t=x_cde_path.grid_points.to(device),
+                        rtol=self.cde_rtol, atol=self.cde_atol, method=self.cde_method
+                    )
+                    
+                    if self.use_attention and self.attention is not None:
+                        b, s, h = z_hat_sequence.shape
+                        attn_weights = self.attention(z_hat_sequence.reshape(-1, h)).view(b, s, 1)
+                        attn_weights = F.softmax(attn_weights, dim=1)
+                        z_hat = torch.sum(z_hat_sequence * attn_weights, dim=1)
+                    else:
+                        z_hat = z_hat_sequence[:, -1]
+
+                    auxiliary_loss = self.auxiliary_task(z_hat, coeffs_x) 
+                    current_loss_val = auxiliary_loss.item()
+
+                    logger.debug(f"TTT (Iter {step + 1}/{self.ttt_steps}): Loss: {current_loss_val:.4f}, LR: {scheduler.get_last_lr()[0]:.2e}")
+                    if not auxiliary_loss.requires_grad:
+                        logger.error(f"TTT CRITICAL: aux_loss no grad @ step {step+1}. grad_fn: {auxiliary_loss.grad_fn}. Stop TTT.")
+                        break
+                    
+                    auxiliary_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(params_to_adapt_list, max_norm=getattr(self, 'ttt_grad_clip_norm', 1.0))
+                    optimizer.step()
+
+                    if current_loss_val < best_loss:
+                        best_loss = current_loss_val
+                        patience_counter = 0
+                        for name, p_model in initial_adapted_params_state.items(): 
+                            best_adapted_state_dict[name] = self.state_dict()[name].clone().detach()
+                    else:
+                        patience_counter += 1
+                        if patience_counter >= self.ttt_early_stopping_patience:
+                            logger.info(f"TTT: Early stop @ step {step + 1}. Best loss: {best_loss:.4f}")
+                            break
+                    scheduler.step()
+            finally:
+                # Restore original training modes
+                for module_to_restore_mode, original_training_state in original_modes.items():
+                    if isinstance(module_to_restore_mode, torch.nn.Module):
+                         module_to_restore_mode.training = original_training_state
+
+            final_load_state = self.state_dict()
+            if best_loss != float('inf') and best_adapted_state_dict:
+                logger.info(f"TTT: Loading best adapted params (loss: {best_loss:.4f}).")
+                for name, param_tensor in best_adapted_state_dict.items():
+                    final_load_state[name] = param_tensor.to(device) 
             else:
-                # Just use the last hidden state if not using attention
-                z_hat = z_hat[:, -1]
-            
-            # Compute auxiliary loss
-            auxiliary_loss = self.auxiliary_task(z_hat, coeffs_x)
-            
-            # Store loss value
-            current_loss = auxiliary_loss.item()
-            ttt_losses.append(current_loss)
-            
-            # Optimize
-            optimizer.zero_grad()
-            auxiliary_loss.backward()
-            
-            # Gradient clipping to prevent instability
-            torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
-            
-            optimizer.step()
-            
-            # Early stopping logic with model state saving
-            if current_loss < best_loss:
-                best_loss = current_loss
-                counter = 0
-                # Save the best model state
-                best_state_dict = {name: param.clone() for name, param in self.named_parameters()}
-            else:
-                counter += 1
-            
-            # Update learning rate
-            scheduler.step()
-            
-            # Stop if no improvement for 'patience' steps
-            if counter >= patience:
-                logging.debug(f"Early stopping at step {step} with best loss: {best_loss:.4f}")
-                break
+                logger.info("TTT: No improvement or TTT skipped. Restoring initial state.")
+                for name, param_tensor in initial_adapted_params_state.items():
+                    if name in final_load_state: 
+                        final_load_state[name] = param_tensor.to(device)
+                    else:
+                        logger.warning(f"TTT: Parameter {name} from initial_adapted_params_state not found in current model state_dict during restore.")
+            self.load_state_dict(final_load_state)
+
+        finally:
+            torch.set_grad_enabled(original_grad_enabled_state) # Restore original grad state
+
+        # Perform a final forward pass with the adapted model
+        with torch.no_grad(): # Ensure this pass doesn't affect gradients or require training mode
+            # Check if we need to handle BatchNorm for batch size 1
+            bn_states = {}
+            if force_bn_eval_if_bs_is_one:
+                # Get batch size from coeffs_x
+                if isinstance(coeffs_x, torch.Tensor):
+                    batch_size = coeffs_x.shape[0]
+                else:
+                    # For path object
+                    batch_size = coeffs_x[0].shape[0] if len(coeffs_x) > 0 else 0
                 
-        # Load the best model parameters if we have them
-        if best_state_dict is not None:
-            for name, param in self.named_parameters():
-                param.data = best_state_dict[name].data
-                
-        # Forward pass with adapted weights
-        pred_y, pred_a_softmax, pred_a, z_hat = self.forward(coeffs_x, device)
-        
-        # Restore original parameters
-        for name, param in self.named_parameters():
-            param.data = original_params[name].data
-        
-        # Log the TTT adaptation performance
-        if len(ttt_losses) > 1:
-            initial_loss = ttt_losses[0]
-            final_loss = ttt_losses[-1]
-            logging.debug(f"TTT adaptation: initial_loss={initial_loss:.4f}, final_loss={final_loss:.4f}, reduction={(initial_loss - final_loss) / initial_loss * 100:.2f}%")
+                # If batch size is 1, force BatchNorm layers to eval mode
+                if batch_size == 1:
+                    # Find all BatchNorm layers and store their current training states
+                    for name, module in self.named_modules():
+                        if isinstance(module, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d)):
+                            bn_states[name] = module.training
+                            module.eval()
+                    logger.info("Final forward pass with batch size 1: Setting BatchNorm layers to eval mode")
             
-        return pred_y, pred_a_softmax, pred_a, z_hat
-    
+            # Using mcd=False for deterministic output after adaptation
+            pred_y_final, pred_a_softmax_final, pred_a_final, z_hat_final = self.forward(coeffs_x, device=device, mcd=False)
+            
+            # Restore original BatchNorm states if changed
+            if bn_states:
+                for name, training in bn_states.items():
+                    if name in dict(self.named_modules()):
+                        dict(self.named_modules())[name].train(training)
+                        
+        return pred_y_final, pred_a_softmax_final, pred_a_final, z_hat_final
+
     def counterfactual_prediction(self, coeffs_x, device, adapt=True):
+
         """
         Generate counterfactual predictions for all possible treatments.
-        
+
         This enhanced version uses the test-time adapted representation when adapt=True
         and incorporates better treatment effect modeling.
-        
+
         Args:
-            coeffs_x: Tensor containing coefficients for interpolation
-            device: Device to run the model on
-            adapt: Whether to perform test-time adaptation
-            
-        Returns:
-            counterfactuals: Dictionary mapping treatment IDs to predicted outcomes
-            z_hat: The latent representation used to generate these counterfactuals
-        """
+            coeffs_x: Tensor containing coefficients for interpolation or Path object.
+            device: Device to run the model on.
+            adapt: Whether to perform test-time adaptation.
+            Returns:
+                counterfactuals: Dictionary mapping treatment IDs to predicted outcomes.
+                z_hat: The latent representation used to generate these counterfactuals.
+            """
+        self.to(device) # Ensure model is on the correct device
+        # Ensure coeffs_x is on the correct device if it's a tensor, or handled if it's a path object
+        coeffs_x_device = coeffs_x.to(device) if isinstance(coeffs_x, torch.Tensor) else coeffs_x
+
         # Run forward pass to get hidden state with adaptation if requested
         if adapt:
-            _, _, _, z_hat = self.ttt_forward(coeffs_x, device)
+            # ttt_forward is expected to return: pred_y, pred_a_softmax, pred_a, z_hat_final
+            # ttt_forward already has BatchNorm handling for batch size 1
+            _, _, _, z_hat = self.ttt_forward(coeffs_x_device, device=device, adapt=True, force_bn_eval_if_bs_is_one=True)
         else:
-            _, _, _, z_hat = self.forward(coeffs_x, device)
+            # Get batch size from coeffs_x_device
+            if isinstance(coeffs_x_device, torch.Tensor):
+                batch_size = coeffs_x_device.shape[0]
+            else:
+                # For path object
+                batch_size = coeffs_x_device[0].shape[0] if len(coeffs_x_device) > 0 else 0
+            
+            # If batch size is 1, temporarily set BatchNorm layers to eval mode
+            bn_states = {}
+            if batch_size == 1:
+                # Find all BatchNorm layers and store their current training states
+                for name, module in self.named_modules():
+                    if isinstance(module, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d)):
+                        bn_states[name] = module.training
+                        module.eval()
+                logger.info("Counterfactual with batch size 1 (no TTT): Setting BatchNorm layers to eval mode")
+            
+            # Run forward pass
+            try:
+                # forward is expected to return: pred_y, pred_a_softmax, pred_a, z_hat
+                _, _, _, z_hat = self.forward(coeffs_x_device, device=device)
+            finally:
+                # Restore original BatchNorm states if changed
+                if bn_states:
+                    for name, training in bn_states.items():
+                        if name in dict(self.named_modules()):
+                            dict(self.named_modules())[name].train(training)
         
-        # Get batch size
+        # Get batch size from z_hat (which should be on the correct device)
         batch_size = z_hat.shape[0]
         
         # Create counterfactuals dictionary
         counterfactuals = {}
         
         # Normalize treatment embeddings for more stable counterfactual predictions
-        normalized_embeddings = F.normalize(self.treatment_embedding, dim=1)
+        # Ensure treatment_embedding is on the correct device
+        treatment_embedding_device = self.treatment_embedding.to(device)
+        normalized_embeddings = F.normalize(treatment_embedding_device, dim=1)
         
         # For each possible treatment
         for treatment_id in range(self.num_treatments):
-            # Get treatment embedding
+            # Get treatment embedding, ensuring it's on the correct device
             t_embedding = normalized_embeddings[treatment_id].unsqueeze(0).repeat(batch_size, 1)
+            # t_embedding is derived from normalized_embeddings which is already on 'device'
             
             # Modify hidden state with treatment embedding using an improved gating mechanism
-            # This allows for more nuanced counterfactual predictions
-            gate = torch.sigmoid(self.treatment_gate(torch.cat([z_hat, t_embedding], dim=1)))
+            # Ensure all inputs to treatment_gate (z_hat, t_embedding) are on the same device.
+            # self.treatment_gate itself should be on 'device' due to self.to(device).
+            gate_input = torch.cat([z_hat, t_embedding], dim=1)
+            gate = torch.sigmoid(self.treatment_gate(gate_input))
             cf_hidden = z_hat + self.cf_strength * gate * t_embedding
             
             # Predict outcome for this counterfactual
+            # self.outcome_net should be on 'device'. cf_hidden is on 'device'.
             cf_outcome = self.outcome_net(cf_hidden)
             
             # Add to counterfactuals dictionary
             counterfactuals[treatment_id] = cf_outcome
         
         return counterfactuals, z_hat
+

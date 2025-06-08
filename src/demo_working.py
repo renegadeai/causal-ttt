@@ -166,7 +166,7 @@ def run_demo():
      
     # Training loop
     logger.info("Beginning training...")
-    num_epochs = 100  # Increased from 20 for more thorough training
+    num_epochs = 10  # Increased from 20 for more thorough training
     batch_size = 32   # Larger batch size for more stable gradients
     train_losses = []
     
@@ -324,7 +324,7 @@ def run_demo():
             # Counterfactuals without TTT adaptation
             cf_outcomes_sample_no_ttt, _ = model.counterfactual_prediction(coeffs_sample, adapt=False, device=device)
             for t_idx in range(treatment_types):
-                all_cf_outcomes_no_ttt[t_idx].append(cf_outcomes_sample_no_ttt[0, t_idx].item())
+                all_cf_outcomes_no_ttt[t_idx].append(cf_outcomes_sample_no_ttt[t_idx].item())
             
             # Counterfactuals with TTT adaptation
             # For TTT-adapted ATE, we need to run ttt_forward first for the specific sample to get adapted params
@@ -337,7 +337,7 @@ def run_demo():
             # The current model.counterfactual_prediction(adapt=True) re-runs TTT for that sample.
             cf_outcomes_sample_ttt, _ = model.counterfactual_prediction(coeffs_sample, adapt=True, device=device)
             for t_idx in range(treatment_types):
-                all_cf_outcomes_ttt[t_idx].append(cf_outcomes_sample_ttt[0, t_idx].item())
+                all_cf_outcomes_ttt[t_idx].append(cf_outcomes_sample_ttt[t_idx].item())
 
     for t_idx in range(treatment_types):
         all_cf_outcomes_no_ttt[t_idx] = np.array(all_cf_outcomes_no_ttt[t_idx])
