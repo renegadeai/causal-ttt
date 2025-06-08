@@ -60,6 +60,9 @@ Key features:
 - Self-supervised auxiliary task for test-time adaptation
 - Support for counterfactual prediction
 """
+    # Store original parameters as class variable
+    _original_state = None
+
     def __init__(
         self, 
         input_channels_x, 
@@ -377,7 +380,7 @@ Key features:
         logger.debug(f"TTT: Aux loss: {loss.item():.4f}, grad: {loss.requires_grad}, grad_fn: {loss.grad_fn is not None}")
         return loss
 
-    def ttt_forward(self, coeffs_x, device, adapt=True, force_bn_eval_if_bs_is_one=False):
+    def ttt_forward(self, coeffs_x, device, adapt=True, force_bn_eval_if_bs_is_one=False, store_original_state=True):
         """
         Forward pass with Test-Time Training (TTT).
         Adapts model parameters to minimize a self-supervised auxiliary loss.
@@ -385,7 +388,8 @@ Key features:
             coeffs_x: Path object or Tensor for input path X.
             device: PyTorch device for computation.
             adapt (bool): If True, performs TTT.
-            force_bn_eval_if_bs_is_one (bool): If True and batch size is 1, forces BatchNorm layers in adapted modules to eval mode.
+            force_bn_eval_if_bs_is_one (bool): If True and batch size is 1, forces BatchNorm layers in eval mode.
+            store_original_state (bool): If True, stores original model state before adaptation.
         Returns:
             Tuple (pred_y, pred_a_softmax, pred_a, z_hat_final): Predictions and final hidden state.
         """
@@ -425,7 +429,12 @@ Key features:
 
         if not adapt:
             return pred_y_initial, pred_a_softmax_initial, pred_a_initial, z_hat_initial
-
+            
+        # Store original model state if requested and not already stored
+        if store_original_state and self.__class__._original_state is None:
+            logger.info("Storing original model state before first TTT adaptation")
+            self.__class__._original_state = {k: v.cpu().clone() for k, v in self.state_dict().items()}
+            
         # Forcefully enable gradients for the TTT scope
         original_grad_enabled_state = torch.is_grad_enabled()
         torch.set_grad_enabled(True)
@@ -434,7 +443,9 @@ Key features:
             modules_to_adapt_config = [
                 (self.auxiliary_network, self.ttt_lr, "auxiliary_network"),
                 (self.cde_func, self.ttt_lr, "cde_func"),
-                (self.embed_x, self.ttt_lr, "embed_x")
+                (self.embed_x, self.ttt_lr, "embed_x"),
+                (self.treatment_gate, self.ttt_lr, "treatment_gate"),
+                (self.outcome_net, self.ttt_lr, "outcome_net")
             ]
             if self.use_attention and self.attention is not None:
                 modules_to_adapt_config.append((self.attention, self.ttt_lr, "attention"))
@@ -602,6 +613,11 @@ Key features:
                     if name in dict(self.named_modules()):
                         dict(self.named_modules())[name].train(training)
                         
+            # If we restored the original state for adapt=False, restore the adapted state now
+            if not adapt and self.__class__._original_state is not None and 'current_state' in locals():
+                logger.info("Restoring adapted model state after non-adapted counterfactual prediction")
+                self.load_state_dict({k: v.to(device) for k, v in current_state.items()})
+                        
         return pred_y_final, pred_a_softmax_final, pred_a_final, z_hat_final
 
     def counterfactual_prediction(self, coeffs_x, device, adapt=True):
@@ -610,7 +626,8 @@ Key features:
         Generate counterfactual predictions for all possible treatments.
 
         This enhanced version uses the test-time adapted representation when adapt=True
-        and incorporates better treatment effect modeling.
+        and incorporates better treatment effect modeling. When adapt=False, it ensures
+        the original non-adapted model state is used.
 
         Args:
             coeffs_x: Tensor containing coefficients for interpolation or Path object.
@@ -630,6 +647,13 @@ Key features:
             # ttt_forward already has BatchNorm handling for batch size 1
             _, _, _, z_hat = self.ttt_forward(coeffs_x_device, device=device, adapt=True, force_bn_eval_if_bs_is_one=True)
         else:
+            # For adapt=False, restore original model state if available
+            if self.__class__._original_state is not None:
+                logger.info("Restoring original non-adapted model state for counterfactual prediction")
+                # Save current state for restoration after counterfactual computation
+                current_state = {k: v.cpu().clone() for k, v in self.state_dict().items()}
+                # Load original non-adapted state
+                self.load_state_dict({k: v.to(device) for k, v in self.__class__._original_state.items()})
             # Get batch size from coeffs_x_device
             if isinstance(coeffs_x_device, torch.Tensor):
                 batch_size = coeffs_x_device.shape[0]
