@@ -14,7 +14,7 @@ class CDEFunc(torch.nn.Module):
     Neural CDE function f_θ.
     
     Defines the f_θ in the CDE definition:
-    z_t = z_0 + \int_0^t f_θ(z_s) dX_s
+    z_t = z_0 + \\int_0^t f_θ(z_s) dX_s
     """
     def __init__(self, hidden_channels, hidden_hidden, input_size):
         super(CDEFunc, self).__init__()
@@ -47,11 +47,7 @@ class TTTNeuralCDE(torch.nn.Module):
     """
     Implementation of a Neural CDE with test-time training.
 
-This module contains the implementation of a Neural Controlled Differential Equation (Neural CDE)
-for causal time-series forecasting, enhanced with test-time training (TTT) capabilities.
-The model builds on the approach described in "Continuous-Time Modeling of Counterfactual Outcomes
-Using Neural Controlled Differential Equations" and incorporates test-time adaptation strategies
-from "Test-Time Training for Forecasting".
+This module contains the implementation of a Test-Time Training Neural Controlled Differential Equation (TTT-Neural CDE) model. It is designed for time series forecasting under distributional shifts, allowing the model to adapt to new data at test time. The model leverages Neural CDEs for continuous-time dynamics and incorporates a test-time adaptation mechanism based on self-supervised learning.
 
 The TTTNeuralCDE class provides:
 1. Standard Neural CDE functionality for time series modeling
@@ -80,7 +76,8 @@ Key features:
         input_has_time=True,
         include_treatment_in_aux=True,
         ttt_early_stopping_patience=5,
-        ttt_lr_decay=0.9
+        ttt_lr_decay=0.9,
+        cf_strength=1.0  # New parameter for counterfactual strength
     ):
         """
         Args:
@@ -128,6 +125,9 @@ Key features:
         self.ttt_lr = ttt_lr
         self.ttt_steps = ttt_steps
         self.ttt_loss_weight = ttt_loss_weight
+        
+        # Store cf_strength
+        self.cf_strength = cf_strength
         
         # Input embedding with batch normalization for stable training
         self.embed_x = torch.nn.Sequential(
@@ -489,6 +489,7 @@ Key features:
             
         Returns:
             counterfactuals: Dictionary mapping treatment IDs to predicted outcomes
+            z_hat: The latent representation used to generate these counterfactuals
         """
         # Run forward pass to get hidden state with adaptation if requested
         if adapt:
@@ -513,7 +514,7 @@ Key features:
             # Modify hidden state with treatment embedding using an improved gating mechanism
             # This allows for more nuanced counterfactual predictions
             gate = torch.sigmoid(self.treatment_gate(torch.cat([z_hat, t_embedding], dim=1)))
-            cf_hidden = z_hat + gate * t_embedding
+            cf_hidden = z_hat + self.cf_strength * gate * t_embedding
             
             # Predict outcome for this counterfactual
             cf_outcome = self.outcome_net(cf_hidden)
@@ -521,4 +522,4 @@ Key features:
             # Add to counterfactuals dictionary
             counterfactuals[treatment_id] = cf_outcome
         
-        return counterfactuals
+        return counterfactuals, z_hat

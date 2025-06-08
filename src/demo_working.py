@@ -55,6 +55,10 @@ def generate_synthetic_data(num_samples=100, seq_len=10, num_features=5,
     else:
         treatment_effects_vals = treatment_effects_vals[:treatment_types]
 
+    # Amplify treatment effects to make them more pronounced
+    treatment_effects_vals = treatment_effects_vals * 10.0
+    logger.debug(f"Amplified treatment_effects_vals: {treatment_effects_vals}")
+
     # Use a more stable way to generate baseline outcomes
     # Consider using a subset of features or a simpler combination
     baseline_y = torch.mean(X[:, -1, :min(num_features, 4)], dim=1) # Use mean of last time step of first few features
@@ -138,28 +142,31 @@ def run_demo():
     logger.info("Creating the TTT-Neural CDE model...")
     model = TTTNeuralCDE(
         input_channels_x=num_features,  # Number of features excluding time
-        hidden_channels=64,             # Larger hidden dimension
+        hidden_channels=64,            # Increased hidden channels
         output_channels=output_dim,
         num_treatments=treatment_types,
         dropout_rate=0.2,              # Slightly higher dropout for regularization
         interpolation_method='linear',
-        ttt_steps=20,                  # More steps for test-time training
+        ttt_steps=15,                  # Adjusted TTT steps
         ttt_lr=0.01,                   # Higher learning rate for adaptation
         ttt_loss_weight=0.2,           # Increased weight for auxiliary task
         include_treatment_in_aux=False,  # Simplified aux task does not include treatment
         use_attention=True,            # Use attention mechanism
         ttt_early_stopping_patience=5, # Early stopping for TTT
-        ttt_lr_decay=0.9              # Learning rate decay for TTT
+        ttt_lr_decay=0.9,             # Learning rate decay for TTT
+        cf_strength=15.0              # Amplify counterfactual differences (increased)
     ).to(device)
     
     # Create optimizer and loss function
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001, weight_decay=1e-5) # Reverted LR, Added weight decay
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=40, gamma=0.5) # Adjusted LR scheduler
     mse_criterion = torch.nn.MSELoss()
     ce_criterion = torch.nn.CrossEntropyLoss()
-    
+    alpha_treatment_loss_weight = 5.0 # Weight for treatment prediction loss
+     
     # Training loop
     logger.info("Beginning training...")
-    num_epochs = 50  # Increased from 20 for more thorough training
+    num_epochs = 100  # Increased from 20 for more thorough training
     batch_size = 32   # Larger batch size for more stable gradients
     train_losses = []
     
@@ -195,7 +202,7 @@ def run_demo():
             auxiliary_loss = model.auxiliary_task(z_hat, batch_coeffs)
             
             # Total loss
-            loss = outcome_loss + 0.5 * treatment_loss + 0.1 * auxiliary_loss
+            loss = outcome_loss + (alpha_treatment_loss_weight * treatment_loss) + 0.1 * auxiliary_loss
             
             # Backward pass
             loss.backward()
@@ -208,7 +215,9 @@ def run_demo():
         # Average loss for epoch
         avg_loss = epoch_loss / num_batches
         train_losses.append(avg_loss)
-        logger.info(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}")
+        current_lr = scheduler.get_last_lr()[0]
+        logger.info(f"Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}, LR: {current_lr:.6f}")
+        scheduler.step() # Step the scheduler
     
     # Save model
     torch.save({
@@ -301,7 +310,49 @@ def run_demo():
     # Compare representations before and after adaptation
     rep_diff = torch.mean(torch.norm(ttt_hidden - std_hidden, dim=1)).item()
     logger.info(f"Mean representation change after adaptation: {rep_diff:.4f}")
-    
+
+    # Calculate Average Treatment Effects (ATE)
+    logger.info("Calculating Average Treatment Effects (ATE)...")
+    all_cf_outcomes_no_ttt = {i: [] for i in range(treatment_types)}
+    all_cf_outcomes_ttt = {i: [] for i in range(treatment_types)}
+
+    model.eval() # Ensure model is in eval mode for counterfactuals
+    with torch.no_grad():
+        for i in range(len(coeffs_test)):
+            coeffs_sample = coeffs_test[i:i+1].to(device)
+            
+            # Counterfactuals without TTT adaptation
+            cf_outcomes_sample_no_ttt, _ = model.counterfactual_prediction(coeffs_sample, adapt=False, device=device)
+            for t_idx in range(treatment_types):
+                all_cf_outcomes_no_ttt[t_idx].append(cf_outcomes_sample_no_ttt[0, t_idx].item())
+            
+            # Counterfactuals with TTT adaptation
+            # For TTT-adapted ATE, we need to run ttt_forward first for the specific sample to get adapted params
+            # This is simplified here by using the model's state *after* batch TTT adaptation on the whole test set.
+            # A more rigorous sample-specific TTT ATE would re-adapt for each sample, which is computationally intensive.
+            # Here, we use the already adapted model state from ttt_forward(coeffs_test, ...)
+            # and apply counterfactual_prediction. This assumes the adaptation is somewhat general.
+            # For a more sample-specific approach, one would call model.ttt_forward(coeffs_sample, adapt=True) 
+            # then model.counterfactual_prediction(coeffs_sample, adapt=False) (as adapt=True in cf_pred re-runs ttt_forward)
+            # The current model.counterfactual_prediction(adapt=True) re-runs TTT for that sample.
+            cf_outcomes_sample_ttt, _ = model.counterfactual_prediction(coeffs_sample, adapt=True, device=device)
+            for t_idx in range(treatment_types):
+                all_cf_outcomes_ttt[t_idx].append(cf_outcomes_sample_ttt[0, t_idx].item())
+
+    for t_idx in range(treatment_types):
+        all_cf_outcomes_no_ttt[t_idx] = np.array(all_cf_outcomes_no_ttt[t_idx])
+        all_cf_outcomes_ttt[t_idx] = np.array(all_cf_outcomes_ttt[t_idx])
+
+    logger.info("Average Treatment Effects (ATE) - No TTT (vs Treatment 0):")
+    for t_idx in range(1, treatment_types):
+        ate_no_ttt = np.mean(all_cf_outcomes_no_ttt[t_idx] - all_cf_outcomes_no_ttt[0])
+        logger.info(f"  ATE for Treatment {t_idx} vs Treatment 0: {ate_no_ttt:.4f}")
+
+    logger.info("Average Treatment Effects (ATE) - With TTT (vs Treatment 0):")
+    for t_idx in range(1, treatment_types):
+        ate_ttt = np.mean(all_cf_outcomes_ttt[t_idx] - all_cf_outcomes_ttt[0])
+        logger.info(f"  ATE for Treatment {t_idx} vs Treatment 0: {ate_ttt:.4f}")
+
     # Save results for visualization later
     results = {
         'standard': {
@@ -355,34 +406,90 @@ def run_demo():
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'prediction_comparison.png'))
     
-    # Counterfactual prediction
-    logger.info("Generating counterfactual predictions...")
-    sample_idx = 0
-    coeffs_sample = coeffs_test[sample_idx:sample_idx+1]
+    # Counterfactual predictions for a few samples
+    logger.info("Generating counterfactual predictions for a few samples (with and without TTT adaptation)...")
+    num_plot_samples = min(5, X_test.shape[0]) # Plot for at most 5 samples
     
-    # Get counterfactuals with TTT
-    counterfactuals = model.counterfactual_prediction(coeffs_sample, device, adapt=True)
+    # Select subset of data for plotting
+    # Ensure coeffs_test_subset is correctly sliced whether it's a tensor or dict of tensors
+    if isinstance(coeffs_test, dict):
+        coeffs_test_subset_for_plot = {k: v[:num_plot_samples].clone().to(device) for k, v in coeffs_test.items()} 
+    else:
+        coeffs_test_subset_for_plot = coeffs_test[:num_plot_samples].clone().to(device)
     
-    # Create bar chart of counterfactuals
-    plt.figure(figsize=(10, 6))
+    y_test_subset_for_plot = y_test[:num_plot_samples].clone().to(device)
+    treatments_test_subset_for_plot = treatments_test[:num_plot_samples].clone().to(device)
+
+    # Generate counterfactual predictions with TTT adaptation (adapt=True)
+    logger.info("Generating counterfactuals with adapt=True (TTT)")
+    cf_predictions_ttt, z_hat_for_cf_ttt = model.counterfactual_prediction(coeffs_test_subset_for_plot, device, adapt=True)
     
-    factual_value = y_test[sample_idx].item()
-    plt.axhline(y=factual_value, color='k', linestyle='-', label='Factual Outcome')
+    # Generate counterfactual predictions without TTT adaptation (adapt=False)
+    logger.info("Generating counterfactuals with adapt=False (No TTT)")
+    # Ensure model is in eval mode and gradients are not computed for this pass if not already handled
+    with torch.no_grad():
+        # Temporarily store original parameters if model was adapted by ttt_forward in cf_predictions_ttt
+        # The counterfactual_prediction method itself handles parameter restoration if adapt=True was used internally.
+        # For adapt=False, it uses self.forward which doesn't change params.
+        cf_predictions_no_ttt, z_hat_for_cf_no_ttt = model.counterfactual_prediction(coeffs_test_subset_for_plot, device, adapt=False)
+
+    # Log z_hat statistics for debugging counterfactuals
+    logger.info(f"z_hat_for_cf_ttt shape: {z_hat_for_cf_ttt.shape}, mean: {z_hat_for_cf_ttt.mean().item():.4f}, std: {z_hat_for_cf_ttt.std().item():.4f}")
+    logger.info(f"z_hat_for_cf_no_ttt shape: {z_hat_for_cf_no_ttt.shape}, mean: {z_hat_for_cf_no_ttt.mean().item():.4f}, std: {z_hat_for_cf_no_ttt.std().item():.4f}")
+    z_hat_diff_norm = torch.norm(z_hat_for_cf_ttt - z_hat_for_cf_no_ttt, p=2).item()
+    logger.info(f"Norm of difference between z_hat_for_cf_ttt and z_hat_for_cf_no_ttt: {z_hat_diff_norm:.4f}")
+
+    # Plot counterfactuals
+    def plot_counterfactuals(coeffs_test_subset, cf_predictions_ttt, cf_predictions_no_ttt, 
+                             y_test_subset, treatments_test_subset, output_dir, num_plot_samples):
+        fig, axes = plt.subplots(num_plot_samples, 2, figsize=(20, 4 * num_plot_samples), squeeze=False)
+        # squeeze=False ensures axes is always a 2D array, even if num_plot_samples is 1
+        
+        for i in range(num_plot_samples):
+            # Plot for adapt=True (TTT)
+            ax_ttt = axes[i, 0]
+            sample_y_true = y_test_subset[i].item()
+            sample_treatment_true_idx = torch.argmax(treatments_test_subset[i]).item()
+
+            sample_cf_outcomes_ttt = {tid: outcomes[i].item() for tid, outcomes in cf_predictions_ttt.items()}
+            treatments_ttt = sorted(sample_cf_outcomes_ttt.keys())
+            outcomes_ttt = [sample_cf_outcomes_ttt[tid] for tid in treatments_ttt]
+
+            bars_ttt = ax_ttt.bar([f"T{t}" for t in treatments_ttt], outcomes_ttt, color='skyblue')
+            for bar in bars_ttt:
+                yval = bar.get_height()
+                ax_ttt.text(bar.get_x() + bar.get_width()/2.0, yval + 0.01 * np.sign(yval) if yval != 0 else 0.01, f'{yval:.2f}', ha='center', va='bottom' if yval >= 0 else 'top', fontsize=8)
+            ax_ttt.axhline(sample_y_true, color='r', linestyle='--', label=f"Actual (T{sample_treatment_true_idx}): {sample_y_true:.2f}")
+            ax_ttt.set_title(f"Sample {i+1} - TTT (adapt=True)\n(Factual T={sample_treatment_true_idx})")
+            ax_ttt.set_ylabel("Predicted Outcome")
+            ax_ttt.set_xlabel("Treatment Type")
+            ax_ttt.legend()
+            ax_ttt.grid(axis='y', linestyle='--', alpha=0.7)
+
+            # Plot for adapt=False (No TTT)
+            ax_no_ttt = axes[i, 1]
+            sample_cf_outcomes_no_ttt = {tid: outcomes[i].item() for tid, outcomes in cf_predictions_no_ttt.items()}
+            treatments_no_ttt = sorted(sample_cf_outcomes_no_ttt.keys())
+            outcomes_no_ttt = [sample_cf_outcomes_no_ttt[tid] for tid in treatments_no_ttt]
+
+            bars_no_ttt = ax_no_ttt.bar([f"T{t}" for t in treatments_no_ttt], outcomes_no_ttt, color='lightcoral')
+            for bar in bars_no_ttt:
+                yval = bar.get_height()
+                ax_no_ttt.text(bar.get_x() + bar.get_width()/2.0, yval + 0.01 * np.sign(yval) if yval != 0 else 0.01, f'{yval:.2f}', ha='center', va='bottom' if yval >= 0 else 'top', fontsize=8)
+            ax_no_ttt.axhline(sample_y_true, color='r', linestyle='--', label=f"Actual (T{sample_treatment_true_idx}): {sample_y_true:.2f}")
+            ax_no_ttt.set_title(f"Sample {i+1} - No TTT (adapt=False)\n(Factual T={sample_treatment_true_idx})")
+            ax_no_ttt.set_ylabel("Predicted Outcome")
+            ax_no_ttt.set_xlabel("Treatment Type")
+            ax_no_ttt.legend()
+            ax_no_ttt.grid(axis='y', linestyle='--', alpha=0.7)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'counterfactual_comparison.png'))
     
-    bars = []
-    bar_labels = []
-    
-    for treatment_id, cf_value in counterfactuals.items():
-        bars.append(cf_value.item())
-        bar_labels.append(f"T{treatment_id}")
-    
-    plt.bar(range(len(bars)), bars, alpha=0.7, tick_label=bar_labels)
-    plt.title('Counterfactual Outcomes')
-    plt.xlabel('Treatment')
-    plt.ylabel('Outcome')
-    plt.grid(True)
-    plt.legend()
-    plt.savefig(os.path.join(output_dir, 'counterfactuals.png'))
+    plot_counterfactuals(coeffs_test_subset_for_plot, cf_predictions_ttt, cf_predictions_no_ttt, 
+                         y_test_subset_for_plot, treatments_test_subset_for_plot, 
+                         output_dir, num_plot_samples)
+    logger.info(f"Counterfactual plots comparing TTT and No TTT saved to {output_dir}")
     
     logger.info(f"Demo completed! Results saved to {output_dir}")
     print("--- SCRIPT END ---")
