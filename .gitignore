@@ -8,6 +8,7 @@ venv/
 .venv/
 env/
 ENV/
+causal-ttt-env/
 
 # Other project folders
 papers/
