@@ -17,6 +17,7 @@ TE-CDE-main/
 # Model checkpoints and generated results
 checkpoints/
 results/
+causal-ttt-v2/CLEANUP_SUMMARY.md
 
 # IDE & OS specific
 .vscode/

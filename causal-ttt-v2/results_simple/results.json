@@ -1,0 +1,94 @@
+{
+  "std_mse": 0.02660900168120861,
+  "ttt_mse": 0.02586628682911396,
+  "prediction_improvement": 2.791216525117358,
+  "policy_metrics": {
+    "std_policy_accuracy": 1.0,
+    "ttt_policy_accuracy": 1.0,
+    "policy_accuracy_improvement": 0.0,
+    "true_treatment_distribution": [
+      0.0,
+      1.0,
+      0.0
+    ],
+    "std_treatment_distribution": [
+      0.0,
+      1.0,
+      0.0
+    ],
+    "ttt_treatment_distribution": [
+      0.0,
+      1.0,
+      0.0
+    ],
+    "std_policy_value": 1.0093620032072068,
+    "ttt_policy_value": 0.9902205735445022,
+    "optimal_policy_value": 0.9951095581054688,
+    "std_policy_regret": -0.014252445101738065,
+    "ttt_policy_regret": 0.004888984560966536,
+    "policy_regret_reduction": -0.0191414296627046,
+    "treatment_effect_learning_success": true
+  },
+  "treatment_effect_analysis": {
+    "std_avg_outcomes": [
+      0.022093393529454868,
+      1.0093620032072068,
+      -0.4728416939576467
+    ],
+    "ttt_avg_outcomes": [
+      0.024654802059133847,
+      0.9902205735445022,
+      -0.4670969024300575
+    ],
+    "correct_ordering_std": true,
+    "correct_ordering_ttt": true,
+    "expected_ordering": [
+      0.0,
+      1.0,
+      -0.5
+    ]
+  },
+  "causal_results": {
+    "pehe": {
+      "pehe": 0.11799205681116014,
+      "pehe_squared": 0.01392212547052804,
+      "pehe_treatment_1": 0.15977608833096796,
+      "pehe_treatment_2": 0.12742832498796663
+    },
+    "ate": {
+      "pred_ate": [
+        0.0,
+        0.9655657714853684,
+        -0.49175170448919137
+      ],
+      "observed_ate": [
+        0.0,
+        0.9425768852233887,
+        -0.5824053287506104
+      ]
+    },
+    "policyvalue": {
+      "policy_value": 0.9902205735445022,
+      "random_policy_value": 0.18259282439119287,
+      "current_policy_value": 0.23053548522293568,
+      "policy_improvement": 0.7596850883215666,
+      "treatment_distribution": [
+        0.0,
+        1.0,
+        0.0
+      ]
+    },
+    "confoundingrobustness": {
+      "treatment_balance": 0.07071067811865475,
+      "outcome_variance_ratio": 1.384872317314148,
+      "treatment_counts": [
+        19,
+        22,
+        19
+      ]
+    },
+    "uncertaintycalibration": {
+      "calibration_error": null
+    }
+  }
+}

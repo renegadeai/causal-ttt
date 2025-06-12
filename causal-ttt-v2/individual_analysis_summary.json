@@ -1,0 +1,24 @@
+{
+  "prediction_performance": {
+    "std_mse": 0.026608997955918312,
+    "ttt_mse": 0.02586628682911396,
+    "ttt_improvement_pct": 2.791203022003174
+  },
+  "policy_accuracy": {
+    "std_policy_accuracy": 1.0,
+    "ttt_policy_accuracy": 1.0,
+    "policy_improvement": 0.0
+  },
+  "treatment_effects": {
+    "std_avg_outcomes": [
+      0.022093393529454868,
+      1.0093620032072068,
+      -0.4728416939576467
+    ],
+    "ttt_avg_outcomes": [
+      0.024654802059133847,
+      0.9902205735445022,
+      -0.4670969024300575
+    ],
+    "true_avg_outcomes": [
+      
